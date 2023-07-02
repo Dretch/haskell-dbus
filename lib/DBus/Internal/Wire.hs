@@ -1,3 +1,4 @@
+{-# Language LambdaCase #-}
 -- Copyright (C) 2009-2012 John Millikin <john@john-millikin.com>
 --
 -- This program is free software: you can redistribute it and/or modify
@@ -34,6 +35,7 @@ import qualified Data.ByteString.Builder as Builder
 import qualified Data.ByteString.Char8
 import qualified Data.ByteString.Lazy as Lazy
 import           Data.Int (Int16, Int32, Int64)
+import           Data.List (sortOn)
 import qualified Data.Map
 import           Data.Map (Map)
 import           Data.Maybe (fromJust, listToMaybe, fromMaybe)
@@ -155,6 +157,7 @@ marshalErrorMessage (MarshalError s) = s
 data MarshalState = MarshalState
     !Builder.Builder
     {-# UNPACK #-} !Word64
+    !(Map Fd Fd)
 
 marshal :: Value -> Marshal ()
 marshal (ValueAtom x) = marshalAtom x
@@ -180,10 +183,10 @@ marshalAtom (AtomObjectPath x) = marshalObjectPath x
 marshalAtom (AtomSignature x) = marshalSignature x
 
 appendB :: Word64 -> Builder.Builder -> Marshal ()
-appendB size bytes = Wire (\_ (MarshalState builder count) -> let
+appendB size bytes = Wire (\_ (MarshalState builder count fds) -> let
     builder' = mappend builder bytes
     count' = count + size
-    in WireRR () (MarshalState builder' count'))
+    in WireRR () (MarshalState builder' count' fds))
 
 appendS :: ByteString -> Marshal ()
 appendS bytes = appendB
@@ -197,7 +200,7 @@ appendL bytes = appendB
 
 pad :: Word8 -> Marshal ()
 pad count = do
-    (MarshalState _ existing) <- getState
+    (MarshalState _ existing _) <- getState
     let padding' = fromIntegral (padding existing count)
     appendS (Data.ByteString.replicate padding' 0)
 
@@ -221,6 +224,7 @@ unmarshalErrorMessage (UnmarshalError s) = s
 data UnmarshalState = UnmarshalState
     {-# UNPACK #-} !ByteString
     {-# UNPACK #-} !Word64
+    ![Fd]
 
 unmarshal :: Type -> Unmarshal Value
 unmarshal TypeWord8 = liftM toValue unmarshalWord8
@@ -245,19 +249,19 @@ unmarshal TypeVariant = unmarshalVariant
 {-# INLINE consume #-}
 consume :: Word64 -> Unmarshal ByteString
 consume count = do
-    (UnmarshalState bytes offset) <- getState
+    (UnmarshalState bytes offset fds) <- getState
     let count' = fromIntegral count
     let (x, bytes') = Data.ByteString.splitAt count' bytes
     let lenConsumed = Data.ByteString.length x
     if lenConsumed == count'
         then do
-            putState (UnmarshalState bytes' (offset + count))
+            putState (UnmarshalState bytes' (offset + count) fds)
             return x
         else throwError ("Unexpected EOF at offset " ++ show (offset + fromIntegral lenConsumed))
 
 skipPadding :: Word8 -> Unmarshal ()
 skipPadding count = do
-    (UnmarshalState _ offset) <- getState
+    (UnmarshalState _ offset _) <- getState
     bytes <- consume (padding offset count)
     unless (Data.ByteString.all (== 0) bytes)
         (throwError ("Value padding " ++ show bytes ++ " contains invalid bytes."))
@@ -345,18 +349,27 @@ unmarshalDouble = unmarshalGet 8
     getFloat64be
     getFloat64le
 
+-- todo: chuck error if fds not supported
 marshalUnixFd :: Fd -> Marshal ()
-marshalUnixFd (Fd x)
+marshalUnixFd fd@(Fd x)
     | x < 0 = throwError ("Invalid file descriptor: " ++ show x)
     | toInteger x > toInteger (maxBound :: Word32) = throwError ("D-Bus forbids file descriptors exceeding UINT32_MAX: " ++ show x)
-    | otherwise = marshalWord32 (fromIntegral x)
+    | otherwise = do
+        MarshalState builder count fds <- getState
+        case Data.Map.lookup fd fds of
+            Just fd' -> marshalWord32 (fromIntegral fd')
+            Nothing -> do
+                let fd' = fromIntegral (Data.Map.size fds)
+                putState (MarshalState builder count (Data.Map.insert fd fd' fds))
+                marshalWord32 (fromIntegral fd')
 
 unmarshalUnixFd :: Unmarshal Fd
 unmarshalUnixFd = do
-    x <- unmarshalWord32
-    when (toInteger x > toInteger (maxBound :: CInt))
-        (throwError ("Invalid file descriptor: " ++ show x))
-    return (Fd (fromIntegral x))
+    x <- fromIntegral <$> unmarshalWord32
+    UnmarshalState _ _ fds <- getState
+    when (x >= length fds) $ do
+        throwError ("File descriptor index " ++ show x ++ " out of bounds - only " ++ show (length fds) ++ " file descriptors in message header.")
+    return (fds !! x)
 
 marshalBool :: Bool -> Marshal ()
 marshalBool False = marshalWord32 0
@@ -443,17 +456,17 @@ marshalStrictBytes bytes = do
 
 getArrayBytes :: Type -> Vector Value -> Marshal (Int, Lazy.ByteString)
 getArrayBytes itemType vs = do
-    s <- getState
-    (MarshalState _ afterLength) <- marshalWord32 0 >> getState
-    (MarshalState _ afterPadding) <- pad (alignment itemType) >> getState
+    MarshalState bytes count fds <- getState
+    (MarshalState _ afterLength _) <- marshalWord32 0 >> getState
+    (MarshalState _ afterPadding _) <- pad (alignment itemType) >> getState
 
-    putState (MarshalState mempty afterPadding)
-    (MarshalState itemBuilder _) <- Data.Vector.mapM_ marshal vs >> getState
+    putState (MarshalState mempty afterPadding fds)
+    (MarshalState itemBuilder _ fds') <- Data.Vector.mapM_ marshal vs >> getState
 
     let itemBytes = Builder.toLazyByteString itemBuilder
         paddingSize = fromIntegral (afterPadding - afterLength)
 
-    putState s
+    putState (MarshalState bytes count fds')
     return (paddingSize, itemBytes)
 
 unmarshalByteArray :: Unmarshal ByteString
@@ -464,7 +477,7 @@ unmarshalByteArray = do
 unmarshalArray :: Type -> Unmarshal (Vector Value)
 unmarshalArray itemType = do
     let getOffset = do
-            (UnmarshalState _ o) <- getState
+            (UnmarshalState _ o _) <- getState
             return o
     byteCount <- unmarshalWord32
     skipPadding (alignment itemType)
@@ -564,35 +577,38 @@ decodeField' x f label = case fromVariant x of
     Nothing -> throwErrorM (UnmarshalError ("Header field " ++ show label ++ " contains invalid value " ++ show x))
 
 marshalMessage :: Message a => Endianness -> Serial -> a
-               -> Either MarshalError ByteString
+               -> Either MarshalError (ByteString, [Fd])
 marshalMessage e serial msg = runMarshal where
     body = messageBody msg
     marshaler = do
         sig <- checkBodySig body
-        empty <- getState
+        MarshalState emptyBytes emptyCount _ <- getState
         mapM_ (marshal . (\(Variant x) -> x)) body
-        (MarshalState bodyBytesB _) <- getState
-        putState empty
+        (MarshalState bodyBytesB _ fds) <- getState
+        putState (MarshalState emptyBytes emptyCount fds)
         marshal (toValue (encodeEndianness e))
         let bodyBytes = Builder.toLazyByteString bodyBytesB
-        marshalHeader msg serial sig (fromIntegral (Lazy.length bodyBytes))
+        marshalHeader msg serial sig (fromIntegral (Lazy.length bodyBytes)) (Data.Map.size fds)
         pad 8
         appendL bodyBytes
         checkMaximumSize
-    emptyState = MarshalState mempty 0
+    emptyState = MarshalState mempty 0 mempty
     runMarshal = case unWire marshaler e emptyState of
         WireRL err -> Left (MarshalError err)
-        WireRR _ (MarshalState builder _) -> Right (Lazy.toStrict (Builder.toLazyByteString builder))
+        WireRR _ (MarshalState builder _ fds) ->
+            let fdList = (map fst . sortOn snd . Data.Map.toList) fds
+            in Right (Lazy.toStrict (Builder.toLazyByteString builder), fdList)
 
 checkBodySig :: [Variant] -> Marshal Signature
 checkBodySig vs = case signature (map variantType vs) of
     Just x -> return x
     Nothing -> throwError ("Message body " ++ show vs ++ " has too many items")
 
-marshalHeader :: Message a => a -> Serial -> Signature -> Word32
+marshalHeader :: Message a => a -> Serial -> Signature -> Word32 -> Int
               -> Marshal ()
-marshalHeader msg serial bodySig bodyLength = do
-    let fields = HeaderSignature bodySig : messageHeaderFields msg
+marshalHeader msg serial bodySig bodyLength numFds = do
+    -- todo: don't send fds header if 0?; what if header already exists?
+    let fields = HeaderSignature bodySig : HeaderUnixFds (fromIntegral numFds) : messageHeaderFields msg
     marshalWord8 (messageTypeCode msg)
     marshalWord8 (messageFlags msg)
     marshalWord8 protocolVersion
@@ -603,13 +619,14 @@ marshalHeader msg serial bodySig bodyLength = do
 
 checkMaximumSize :: Marshal ()
 checkMaximumSize = do
-    (MarshalState _ messageLength) <- getState
+    (MarshalState _ messageLength _) <- getState
     when (toInteger messageLength > messageMaximumLength)
         (throwError ("Marshaled message size (" ++ show messageLength ++ " bytes) exeeds maximum limit of (" ++ show messageMaximumLength ++ " bytes)."))
 
-unmarshalMessageM :: Monad m => (Int -> m ByteString)
+-- todo: check the unixfds header matches the length of fd...
+unmarshalMessageM :: Monad m => (Int -> m ByteString) -> [Fd]
                   -> m (Either UnmarshalError ReceivedMessage)
-unmarshalMessageM getBytes' = runErrorT $ do
+unmarshalMessageM getBytes' fds = runErrorT $ do
     let getBytes count = do
             bytes <- ErrorT (liftM Right (getBytes' count))
             if Data.ByteString.length bytes < count
@@ -628,7 +645,7 @@ unmarshalMessageM getBytes' = runErrorT $ do
         Nothing -> throwErrorT (UnmarshalError ("Invalid endianness: " ++ show eByte))
 
     let unmarshalSig = mapM unmarshal . signatureTypes
-    let unmarshal' x bytes = case unWire (unmarshalSig x) endianness (UnmarshalState bytes 0) of
+    let unmarshal' x bytes = case unWire (unmarshalSig x) endianness (UnmarshalState bytes 0 fds) of
             WireRR x' _ -> return x'
             WireRL err  -> throwErrorT (UnmarshalError err)
     fixed <- unmarshal' fixedSig fixedBytes
@@ -713,9 +730,9 @@ require :: String -> [a] -> ErrorM String a
 require _     (x:_) = return x
 require label _     = throwErrorM label
 
-unmarshalMessage :: ByteString -> Either UnmarshalError ReceivedMessage
-unmarshalMessage bytes = checkError (Get.runGet get bytes) where
-    get = unmarshalMessageM getBytes
+unmarshalMessage :: ByteString -> [Fd] -> Either UnmarshalError ReceivedMessage
+unmarshalMessage bytes fds = checkError (Get.runGet get bytes) where
+    get = unmarshalMessageM getBytes fds
 
     -- wrap getByteString, so it will behave like transportGet and return
     -- a truncated result on EOF instead of throwing an exception.

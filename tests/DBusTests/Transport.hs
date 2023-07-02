@@ -294,9 +294,9 @@ test_TransportSendReceive = testCase "send-receive" $ runResourceT $ do
     -- small chunks of data are combined
     do
         var <- forkVar (transportGet t 3)
-        liftIO (transportPut t "1")
-        liftIO (transportPut t "2")
-        liftIO (transportPut t "3")
+        liftIO (transportPut t "1" [])
+        liftIO (transportPut t "2" [])
+        liftIO (transportPut t "3" [])
         bytes <- liftIO (readMVar var)
         liftIO (bytes @?= "123")
 
@@ -304,7 +304,7 @@ test_TransportSendReceive = testCase "send-receive" $ runResourceT $ do
     do
         let sentBytes = Data.ByteString.replicate (4096 * 100) 0
         var <- forkVar (transportGet t (4096 * 100))
-        liftIO (transportPut t sentBytes)
+        liftIO (transportPut t sentBytes [])
         bytes <- liftIO (readMVar var)
         liftIO (bytes @?= sentBytes)
 
@@ -519,7 +519,7 @@ test_AcceptSocket = testCase "socket" $ runResourceT $ do
     (_, accepted) <- allocate (readMVar acceptedVar) transportClose
     (_, opened) <- allocate (readMVar openedVar) transportClose
 
-    liftIO (transportPut opened "testing")
+    liftIO (transportPut opened "testing" [])
 
     bytes <- liftIO (transportGet accepted 7)
 

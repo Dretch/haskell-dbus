@@ -257,10 +257,10 @@ send :: Message msg => Socket -> msg -> (Serial -> IO a) -> IO a
 send sock msg io = toSocketError (socketAddress sock) $ do
     serial <- nextSocketSerial sock
     case marshal LittleEndian serial msg of
-        Right bytes -> do
+        Right (bytes, fds) -> do
             let t = socketTransport sock
             a <- io serial
-            withMVar (socketWriteLock sock) (\_ -> transportPut t bytes)
+            withMVar (socketWriteLock sock) (\_ -> transportPut t bytes fds)
             return a
         Left err -> throwIO (socketError ("Message cannot be sent: " ++ show err))
             { socketErrorFatal = False
@@ -285,7 +285,7 @@ receive sock = toSocketError (socketAddress sock) $ do
     let get n = if n == 0
             then return Data.ByteString.empty
             else transportGet t n
-    received <- withMVar (socketReadLock sock) (\_ -> unmarshalMessageM get)
+    received <- withMVar (socketReadLock sock) (\_ -> unmarshalMessageM get []) -- todo: recv fds
     case received of
         Left err -> throwIO (socketError ("Error reading message from socket: " ++ show err))
         Right msg -> return msg
@@ -331,17 +331,29 @@ authExternal = authenticator
     , authenticatorServer = serverAuthExternal
     }
 
+-- data UnixFdOptions
+--     = DisallowUnixFds -- ^ Don't ask for FD support. Throw error on usage. (todo: make default, since fds only supported on unix)
+--     | RequestUnixFds  -- ^ Ask for FD support, but allow connection without and throw error if used and not supported. (todo: add method to say if supported) (todo: need this one at all?)
+--     | RequireUnixFds  -- ^ Ask for FD support and don't allow connection without it.
+
+-- todo: chuck error if user attempts to send fds when we have not negatioted support?
+-- (but don't error on connection!?) (possible only negiote if users wants?)
 clientAuthExternal :: SocketTransport -> IO Bool
 clientAuthExternal t = do
-    transportPut t (Data.ByteString.pack [0])
+    transportPut t (Data.ByteString.pack [0]) []
     uid <- System.Posix.User.getRealUserID
     let token = concatMap (printf "%02X" . ord) (show uid)
     transportPutLine t ("AUTH EXTERNAL " ++ token)
     resp <- transportGetLine t
     case splitPrefix "OK " resp of
         Just _ -> do
-            transportPutLine t "BEGIN"
-            return True
+            transportPutLine t "NEGOTIATE_UNIX_FD"
+            respFd <- transportGetLine t
+            if respFd == "AGREE_UNIX_FD" then do
+                transportPutLine t "BEGIN"
+                return True
+            else
+                return False
         Nothing -> return False
 
 serverAuthExternal :: SocketTransport -> UUID -> IO Bool
@@ -378,7 +390,7 @@ serverAuthExternal t uuid = do
                     else return False
 
 transportPutLine :: Transport t => t -> String -> IO ()
-transportPutLine t line = transportPut t (Char8.pack (line ++ "\r\n"))
+transportPutLine t line = transportPut t (Char8.pack (line ++ "\r\n")) []
 
 transportGetLine :: Transport t => t -> IO String
 transportGetLine t = do

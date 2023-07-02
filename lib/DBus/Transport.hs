@@ -37,17 +37,24 @@ module DBus.Transport
     ) where
 
 import           Control.Exception
+import           Control.Concurrent (rtsSupportsBoundThreads, threadWaitWrite)
+import           Control.Monad (when)
 import qualified Data.ByteString
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString.Builder as Builder
 import qualified Data.ByteString.Lazy as Lazy
+import           Data.ByteString.Unsafe (unsafeUseAsCString)
 import qualified Data.Map as Map
 import           Data.Monoid
 import           Data.Typeable (Typeable)
 import           Foreign.C (CUInt)
+import           Foreign.Ptr (castPtr, plusPtr)
 import           Network.Socket
-import           Network.Socket.ByteString (sendAll, recv)
+import           Network.Socket.Address (SocketAddress(..))
+import qualified Network.Socket.Address
+import           Network.Socket.ByteString (recv)
 import qualified System.Info
+import           System.Posix.Types (Fd(..))
 import           Prelude
 
 import           DBus
@@ -76,7 +83,7 @@ class Transport t where
     -- | Send a 'ByteString' over the transport.
     --
     -- Throws a 'TransportError' if an error occurs.
-    transportPut :: t -> ByteString -> IO ()
+    transportPut :: t -> ByteString -> [Fd] -> IO ()
 
     -- | Receive a 'ByteString' of the given size from the transport. The
     -- transport should block until sufficient bytes are available, and
@@ -145,10 +152,30 @@ instance Transport SocketTransport where
           socketTransportOptionBacklog :: Int
         }
     transportDefaultOptions = SocketTransportOptions 30
-    transportPut (SocketTransport addr s) bytes = catchIOException addr (sendAll s bytes)
+    transportPut (SocketTransport addr s) bytes fds = catchIOException addr (sendWithFds s bytes fds)
     transportGet (SocketTransport addr s) n = catchIOException addr (recvLoop s n)
     transportClose (SocketTransport addr s) = catchIOException addr (close s)
 
+data NullSockAddr = NullSockAddr
+
+instance SocketAddress NullSockAddr where
+    sizeOfSocketAddress NullSockAddr = 0
+    peekSocketAddress _ptr = pure NullSockAddr
+    pokeSocketAddress _ptr NullSockAddr = pure ()
+
+sendWithFds :: Socket -> ByteString -> [Fd] -> IO ()
+sendWithFds s msg fds = loop 0 where
+    loop acc  = do
+        n <- unsafeUseAsCString msg $ \cstr -> do
+            let cmsgs = if acc == 0 then (encodeCmsg <$> fds) else []
+                buf = [(plusPtr (castPtr cstr) acc, len - acc)]
+            Network.Socket.Address.sendBufMsg s NullSockAddr buf cmsgs mempty
+        waitWhen0 n s
+        when (acc + n < len) $ do
+            loop (acc + n)
+    len = Data.ByteString.length msg
+
+-- todo: support receiving fds
 recvLoop :: Socket -> Int -> IO ByteString
 recvLoop s = \n -> Lazy.toStrict `fmap` loop mempty n where
     chunkSize = 4096
@@ -446,3 +473,8 @@ readPortNumber s = do
     if word > 0 && word <= 65535
         then Just (fromInteger word)
         else Nothing
+
+waitWhen0 :: Int -> Socket -> IO ()
+waitWhen0 0 s = when rtsSupportsBoundThreads $
+    withFdSocket s $ \fd -> threadWaitWrite $ fromIntegral fd
+waitWhen0 _ _ = return ()

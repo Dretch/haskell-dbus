@@ -36,7 +36,7 @@ test_Unmarshal = testGroup "unmarshal"
 
 test_UnmarshalUnexpectedEof :: TestTree
 test_UnmarshalUnexpectedEof = testCase "unexpected-eof" $ do
-    let unmarshaled = unmarshal "0"
+    let unmarshaled = unmarshal "0" []
     assertBool "invalid unmarshalled parse" (isLeft unmarshaled)
 
     let Left err = unmarshaled
