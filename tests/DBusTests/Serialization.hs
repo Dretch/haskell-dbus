@@ -22,7 +22,7 @@ import Data.Map (Map)
 import Data.Text (Text)
 import Data.Word (Word8, Word16, Word32, Word64)
 import Foreign.C.Types (CInt)
-import System.Posix.Types (Fd)
+import System.Posix (Fd)
 import Test.QuickCheck
 import Test.Tasty
 import Test.Tasty.QuickCheck

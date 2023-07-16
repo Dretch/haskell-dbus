@@ -46,7 +46,7 @@ import qualified Data.Vector
 import           Data.Vector (Vector)
 import           Data.Word (Word8, Word16, Word32, Word64)
 import           Foreign.C.Types (CInt)
-import           System.Posix.Types (Fd(..))
+import           System.Posix (Fd(..))
 import           Prelude
 
 import qualified Data.Serialize.Get as Get

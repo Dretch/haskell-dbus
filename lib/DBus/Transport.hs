@@ -57,7 +57,7 @@ import           Network.Socket.Address (SocketAddress(..))
 import qualified Network.Socket.Address
 import           Network.Socket.ByteString (recvMsg)
 import qualified System.Info
-import           System.Posix.Types (Fd)
+import           System.Posix (Fd)
 import           Prelude
 
 import           DBus

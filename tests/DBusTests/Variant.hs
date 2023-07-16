@@ -21,7 +21,7 @@ import Test.Tasty.HUnit
 
 import Data.Int (Int16, Int32, Int64)
 import Data.Word (Word8, Word16, Word32, Word64)
-import System.Posix.Types (Fd)
+import System.Posix (Fd)
 import qualified Data.ByteString
 import qualified Data.ByteString.Lazy
 import qualified Data.Map
