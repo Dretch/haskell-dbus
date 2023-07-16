@@ -44,7 +44,7 @@ import           Data.Vector (Vector)
 import           Data.Word
 import           GHC.Generics
 import qualified Language.Haskell.TH.Lift as THL
-import           System.Posix (Fd)
+import           System.Posix.Types (Fd)
 import           Text.ParserCombinators.Parsec ((<|>), oneOf)
 import qualified Text.ParserCombinators.Parsec as Parsec
 

@@ -25,7 +25,7 @@ import           Data.Traversable
 import           Data.Word
 import           Language.Haskell.TH
 import           Prelude hiding (mapM)
-import           System.Posix (Fd(..))
+import           System.Posix.Types (Fd(..))
 
 -- | Compatibility helper to create (total) tuple expressions
 mkTupE :: [Exp] -> Exp
