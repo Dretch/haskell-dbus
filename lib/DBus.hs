@@ -174,7 +174,7 @@ import           Control.Monad (replicateM)
 import qualified Data.ByteString.Char8 as Char8
 import           Data.Proxy (Proxy(..))
 import           Data.Word (Word16)
-import           System.Posix.Types (Fd(..))
+import           System.Posix.Types (Fd)
 import           System.Random (randomRIO)
 import           Text.Printf (printf)
 

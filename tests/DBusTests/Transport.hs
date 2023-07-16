@@ -17,13 +17,20 @@
 module DBusTests.Transport (test_Transport) where
 
 import Control.Concurrent
+import Control.Monad (void)
 import Control.Monad.Extra (unlessM)
-import Control.Monad.IO.Class (liftIO)
+import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Trans.Resource
+import Data.ByteString.Unsafe (unsafeUseAsCString)
 import Data.Function (fix)
 import Data.List (isInfixOf)
-import Network.Socket.ByteString (sendAll, recv)
+import Foreign.Ptr (castPtr)
+import Network.Socket (Socket)
+import Network.Socket.Address (SocketAddress(..), sendBufMsg)
+import Network.Socket.ByteString (recvMsg, sendAll, sendMsg)
 import System.Directory (getTemporaryDirectory, removeFile)
+import System.IO (SeekMode(..))
+import System.Posix (fdRead, fdSeek, fdWrite)
 import Test.Tasty
 import Test.Tasty.HUnit
 import qualified Data.ByteString
@@ -41,6 +48,7 @@ test_Transport = testGroup "Transport" $
     , suite_TransportListen
     , suite_TransportAccept
     , test_TransportSendReceive
+    , test_TransportSendReceive_FileDescriptors
     , test_HandleLostConnection
     ]
 
@@ -95,7 +103,7 @@ test_OpenUnix_Path = testCase "path" $ runResourceT $ do
 
 test_OpenUnix_Abstract :: TestTree
 test_OpenUnix_Abstract = testCase "abstract" $ runResourceT $ do
-    (addr, _) <- listenRandomUnixAbstract
+    (addr, _, _) <- listenRandomUnixAbstract
     fdcountBefore <- countFileDescriptors
 
     t <- liftIO (transportOpen socketTransportOptions addr)
@@ -139,7 +147,7 @@ test_OpenUnix_NotListening :: TestTree
 test_OpenUnix_NotListening = testCase "not-listening" $ runResourceT $ do
     fdcountBefore <- countFileDescriptors
 
-    (addr, key) <- listenRandomUnixAbstract
+    (addr, _sock, key) <- listenRandomUnixAbstract
     release key
 
     liftIO $ assertThrows
@@ -275,17 +283,7 @@ test_OpenTcp_NotListening = testCase "not-listening" $ runResourceT $ do
 test_TransportSendReceive :: TestTree
 test_TransportSendReceive = testCase "send-receive" $ runResourceT $ do
     (addr, networkSocket, _) <- listenRandomIPv4
-
-    -- a simple echo server, which sends back anything it receives.
-    _ <- liftIO $ forkIO $ do
-        (s, _) <- NS.accept networkSocket
-        fix $ \loop -> do
-            bytes <- recv s 50
-            if Data.ByteString.null bytes
-                then NS.close s
-                else do
-                    sendAll s bytes
-                    loop
+    startEchoServer networkSocket
 
     (_, t) <- allocate
         (transportOpen socketTransportOptions addr)
@@ -297,20 +295,49 @@ test_TransportSendReceive = testCase "send-receive" $ runResourceT $ do
         liftIO (transportPut t "1" [])
         liftIO (transportPut t "2" [])
         liftIO (transportPut t "3" [])
-        bytes <- liftIO (readMVar var)
-        liftIO (bytes @?= "123")
+        result <- liftIO (readMVar var)
+        liftIO (result @?= ("123", []))
 
     -- large chunks of data are read in full
     do
         let sentBytes = Data.ByteString.replicate (4096 * 100) 0
         var <- forkVar (transportGet t (4096 * 100))
         liftIO (transportPut t sentBytes [])
-        bytes <- liftIO (readMVar var)
-        liftIO (bytes @?= sentBytes)
+        result <- liftIO (readMVar var)
+        liftIO (result @?= (sentBytes, []))
+
+test_TransportSendReceive_FileDescriptors :: TestTree
+test_TransportSendReceive_FileDescriptors = nonWindowsTestCase "send-receive-file-descriptors" $ runResourceT $ do
+    (addr, networkSocket, _) <- listenRandomUnixAbstract
+    startEchoServer networkSocket
+
+    (_, t) <- allocate
+        (transportOpen socketTransportOptions addr)
+        transportClose
+    
+    liftIO $ withTempFd $ \fd1 -> withTempFd $ \fd2 -> do
+
+        -- in order to know that the file descriptors received back from the echo server
+        -- point to the same files as the file descriptors that were sent, we write data
+        -- on the initial file descriptors and read it back from the returned ones.
+        void $ fdWrite fd1 "1"
+        void $ fdSeek fd1 AbsoluteSeek 0
+        void $ fdWrite fd2 "2"
+        void $ fdSeek fd2 AbsoluteSeek 0
+
+        -- file descriptors from multiple chunks are combined
+        var <- forkVar (transportGet t 2)
+        liftIO (transportPut t "1" [fd1])
+        liftIO (transportPut t "2" [fd2])
+        ("12", [fd1', fd2']) <- liftIO (readMVar var)
+        (fd1Val, _) <- liftIO (fdRead fd1' 1)
+        (fd2Val, _) <- liftIO (fdRead fd2' 2)
+        fd1Val @?= "1"
+        fd2Val @?= "2"
 
 test_HandleLostConnection :: TestTree
 test_HandleLostConnection = testCase "handle-lost-connection" $ runResourceT $ do
-    (addr, networkSocket, _) <- listenRandomIPv4
+    (addr, networkSocket, _) <- listenRandomIPv4 -- todo:this should error!
 
     _ <- liftIO $ forkIO $ do
         (s, _) <- NS.accept networkSocket
@@ -321,8 +348,8 @@ test_HandleLostConnection = testCase "handle-lost-connection" $ runResourceT $ d
         (transportOpen socketTransportOptions addr)
         transportClose
 
-    bytes <- liftIO (transportGet t 4)
-    liftIO (bytes @?= "123")
+    result <- liftIO (transportGet t 4)
+    liftIO (result @?= ("123", []))
 
 test_ListenUnknown :: TestTree
 test_ListenUnknown = testCase "unknown" $ do
@@ -521,9 +548,9 @@ test_AcceptSocket = testCase "socket" $ runResourceT $ do
 
     liftIO (transportPut opened "testing" [])
 
-    bytes <- liftIO (transportGet accepted 7)
+    result <- liftIO (transportGet accepted 7)
 
-    liftIO (bytes @?= "testing")
+    liftIO (result @?= ("testing", []))
 
 test_AcceptSocketClosed :: TestTree
 test_AcceptSocketClosed = testCase "socket-closed" $ do
@@ -544,3 +571,25 @@ test_AcceptSocketClosed = testCase "socket-closed" $ do
 
 socketTransportOptions :: TransportOptions SocketTransport
 socketTransportOptions = transportDefaultOptions
+
+data NullSockAddr = NullSockAddr
+
+instance SocketAddress NullSockAddr where
+    sizeOfSocketAddress NullSockAddr = 0
+    peekSocketAddress _ptr = return NullSockAddr
+    pokeSocketAddress _ptr NullSockAddr = return ()
+
+-- a simple echo server, which sends back anything it receives.
+startEchoServer :: MonadIO m => Socket -> m ()
+startEchoServer listenSocket = do
+    void . liftIO . forkIO $ do
+        (s, _) <- NS.accept listenSocket
+        fix $ \loop -> do
+            (_sa, bytes, cmsgs, _flag) <- recvMsg s 50 128 mempty
+            if Data.ByteString.null bytes
+                then NS.close s
+                else do
+                    void . unsafeUseAsCString bytes $ \cstr -> do
+                        let buf = [(castPtr cstr, Data.ByteString.length bytes)]
+                        sendBufMsg s NullSockAddr buf cmsgs mempty
+                    loop

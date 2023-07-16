@@ -1,4 +1,5 @@
 {-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TypeFamilies #-}
 
 -- Copyright (C) 2009-2012 John Millikin <john@john-millikin.com>
@@ -45,16 +46,18 @@ import qualified Data.ByteString.Builder as Builder
 import qualified Data.ByteString.Lazy as Lazy
 import           Data.ByteString.Unsafe (unsafeUseAsCString)
 import qualified Data.Map as Map
+import           Data.Maybe (catMaybes)
 import           Data.Monoid
 import           Data.Typeable (Typeable)
-import           Foreign.C (CUInt)
+import           Foreign.C (CInt, CUInt)
 import           Foreign.Ptr (castPtr, plusPtr)
+import           Foreign.Storable (sizeOf)
 import           Network.Socket
 import           Network.Socket.Address (SocketAddress(..))
 import qualified Network.Socket.Address
-import           Network.Socket.ByteString (recv)
+import           Network.Socket.ByteString (recvMsg)
 import qualified System.Info
-import           System.Posix.Types (Fd(..))
+import           System.Posix.Types (Fd)
 import           Prelude
 
 import           DBus
@@ -91,7 +94,7 @@ class Transport t where
     -- any more data.
     --
     -- Throws a 'TransportError' if an error occurs.
-    transportGet :: t -> Int -> IO ByteString
+    transportGet :: t -> Int -> IO (ByteString, [Fd])
 
     -- | Close an open transport, and release any associated resources
     -- or handles.
@@ -153,15 +156,15 @@ instance Transport SocketTransport where
         }
     transportDefaultOptions = SocketTransportOptions 30
     transportPut (SocketTransport addr s) bytes fds = catchIOException addr (sendWithFds s bytes fds)
-    transportGet (SocketTransport addr s) n = catchIOException addr (recvLoop s n)
+    transportGet (SocketTransport addr s) n = catchIOException addr (recvWithFds s n)
     transportClose (SocketTransport addr s) = catchIOException addr (close s)
 
 data NullSockAddr = NullSockAddr
 
 instance SocketAddress NullSockAddr where
     sizeOfSocketAddress NullSockAddr = 0
-    peekSocketAddress _ptr = pure NullSockAddr
-    pokeSocketAddress _ptr NullSockAddr = pure ()
+    peekSocketAddress _ptr = return NullSockAddr
+    pokeSocketAddress _ptr NullSockAddr = return ()
 
 sendWithFds :: Socket -> ByteString -> [Fd] -> IO ()
 sendWithFds s msg fds = loop 0 where
@@ -175,27 +178,22 @@ sendWithFds s msg fds = loop 0 where
             loop (acc + n)
     len = Data.ByteString.length msg
 
--- todo: support receiving fds
-recvLoop :: Socket -> Int -> IO ByteString
-recvLoop s = \n -> Lazy.toStrict `fmap` loop mempty n where
+recvWithFds :: Socket -> Int -> IO (ByteString, [Fd])
+recvWithFds s = loop mempty [] where
+    loop accBuf accFds n = do
+        (_sa, buf, cmsgs, flag) <- recvMsg s (min n chunkSize) cmsgsSize mempty
+        let recvLen = Data.ByteString.length buf
+            accBuf' = accBuf <> Builder.byteString buf
+            accFds' = accFds <> decodeFdCmsgs cmsgs
+        case flag of
+            MSG_CTRUNC -> throwIO (transportError ("Unexpected MSG_CTRUNC: more than " <> show maxFds <> " file descriptors?"))
+            -- no data means unexpected end of connection; maybe the remote end went away.
+            _ | recvLen == 0 || recvLen == n -> do
+                return (Lazy.toStrict (Builder.toLazyByteString accBuf'), accFds')
+            _ -> loop accBuf' accFds' (n - recvLen)
     chunkSize = 4096
-    loop acc n = if n > chunkSize
-        then do
-            chunk <- recv s chunkSize
-            let builder = mappend acc (Builder.byteString chunk)
-            loop builder (n - Data.ByteString.length chunk)
-        else do
-            chunk <- recv s n
-            case Data.ByteString.length chunk of
-                -- Unexpected end of connection; maybe the remote end went away.
-                -- Return what we've got so far.
-                0 -> return (Builder.toLazyByteString acc)
-
-                len -> do
-                    let builder = mappend acc (Builder.byteString chunk)
-                    if len == n
-                        then return (Builder.toLazyByteString builder)
-                        else loop builder (n - Data.ByteString.length chunk)
+    maxFds = 16 -- same as DBUS_DEFAULT_MESSAGE_UNIX_FDS in reference implementation
+    cmsgsSize = sizeOf (0 :: CInt) * maxFds
 
 instance TransportOpen SocketTransport where
     transportOpen _ a = case addressMethod a of
@@ -478,3 +476,7 @@ waitWhen0 :: Int -> Socket -> IO ()
 waitWhen0 0 s = when rtsSupportsBoundThreads $
     withFdSocket s $ \fd -> threadWaitWrite $ fromIntegral fd
 waitWhen0 _ _ = return ()
+
+decodeFdCmsgs :: [Cmsg] -> [Fd]
+decodeFdCmsgs cmsgs =
+    catMaybes (decodeCmsg <$> cmsgs)

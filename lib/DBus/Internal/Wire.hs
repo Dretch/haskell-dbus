@@ -607,8 +607,7 @@ checkBodySig vs = case signature (map variantType vs) of
 marshalHeader :: Message a => a -> Serial -> Signature -> Word32 -> Int
               -> Marshal ()
 marshalHeader msg serial bodySig bodyLength numFds = do
-    -- todo: don't send fds header if 0?; what if header already exists?
-    let fields = HeaderSignature bodySig : HeaderUnixFds (fromIntegral numFds) : messageHeaderFields msg
+    let fields = HeaderSignature bodySig : consUnixFdsField numFds (messageHeaderFields msg)
     marshalWord8 (messageTypeCode msg)
     marshalWord8 (messageFlags msg)
     marshalWord8 protocolVersion
@@ -617,24 +616,34 @@ marshalHeader msg serial bodySig bodyLength numFds = do
     let fieldType = TypeStructure [TypeWord8, TypeVariant]
     marshalVector fieldType (Data.Vector.fromList (map encodeField fields))
 
+consUnixFdsField :: Int -> [HeaderField] -> [HeaderField]
+consUnixFdsField numFds headers =
+    if numFds == 0
+        then filteredHeaders
+        else HeaderUnixFds (fromIntegral numFds) : filteredHeaders
+    where
+        filteredHeaders = filter (not . isHeaderUnixFds) headers
+        isHeaderUnixFds = \case
+            HeaderUnixFds _ -> True
+            _ -> False
+
 checkMaximumSize :: Marshal ()
 checkMaximumSize = do
     (MarshalState _ messageLength _) <- getState
     when (toInteger messageLength > messageMaximumLength)
         (throwError ("Marshaled message size (" ++ show messageLength ++ " bytes) exeeds maximum limit of (" ++ show messageMaximumLength ++ " bytes)."))
 
--- todo: check the unixfds header matches the length of fd...
-unmarshalMessageM :: Monad m => (Int -> m ByteString) -> [Fd]
+unmarshalMessageM :: Monad m => (Int -> m (ByteString, [Fd]))
                   -> m (Either UnmarshalError ReceivedMessage)
-unmarshalMessageM getBytes' fds = runErrorT $ do
+unmarshalMessageM getBytes' = runErrorT $ do
     let getBytes count = do
-            bytes <- ErrorT (liftM Right (getBytes' count))
+            (bytes, fds) <- ErrorT (liftM Right (getBytes' count))
             if Data.ByteString.length bytes < count
                 then throwErrorT (UnmarshalError "Unexpected end of input while parsing message header.")
-                else return bytes
+                else return (bytes, fds)
 
     let Just fixedSig = parseSignature "yyyyuuu"
-    fixedBytes <- getBytes 16
+    (fixedBytes, fds) <- getBytes 16
 
     let messageVersion = Data.ByteString.index fixedBytes 3
     when (messageVersion /= protocolVersion) (throwErrorT (UnmarshalError ("Unsupported protocol version: " ++ show messageVersion)))
@@ -645,10 +654,10 @@ unmarshalMessageM getBytes' fds = runErrorT $ do
         Nothing -> throwErrorT (UnmarshalError ("Invalid endianness: " ++ show eByte))
 
     let unmarshalSig = mapM unmarshal . signatureTypes
-    let unmarshal' x bytes = case unWire (unmarshalSig x) endianness (UnmarshalState bytes 0 fds) of
+    let unmarshal' x bytes fds = case unWire (unmarshalSig x) endianness (UnmarshalState bytes 0 fds) of
             WireRR x' _ -> return x'
             WireRL err  -> throwErrorT (UnmarshalError err)
-    fixed <- unmarshal' fixedSig fixedBytes
+    fixed <- unmarshal' fixedSig fixedBytes []
     let messageType = fromJust (fromValue (fixed !! 1))
     let flags = fromJust (fromValue (fixed !! 2))
     let bodyLength = fromJust (fromValue (fixed !! 4)) :: Word32
@@ -663,25 +672,37 @@ unmarshalMessageM getBytes' fds = runErrorT $ do
         throwErrorT (UnmarshalError ("Message size " ++ show messageLength ++ " exceeds limit of " ++ show messageMaximumLength))
 
     let Just headerSig  = parseSignature "yyyyuua(yv)"
-    fieldBytes <- getBytes (fromIntegral fieldByteCount)
+    (fieldBytes, _) <- getBytes (fromIntegral fieldByteCount)
     let headerBytes = Data.ByteString.append fixedBytes fieldBytes
-    header <- unmarshal' headerSig headerBytes
+    header <- unmarshal' headerSig headerBytes []
 
     let fieldArray = Data.Vector.toList (fromJust (fromValue (header !! 6)))
     fields <- case runErrorM $ concat `liftM` mapM decodeField fieldArray of
         Left err -> throwErrorT err
         Right x -> return x
     _ <- getBytes (fromIntegral bodyPadding)
+    checkUnixFdsHeader fields fds
     let bodySig = findBodySignature fields
-    bodyBytes <- getBytes (fromIntegral bodyLength)
-    body <- unmarshal' bodySig bodyBytes
+    (bodyBytes, _) <- getBytes (fromIntegral bodyLength)
+    body <- unmarshal' bodySig bodyBytes fds
     y <- case runErrorM (buildReceivedMessage messageType fields) of
         Right x -> return x
         Left err -> throwErrorT (UnmarshalError ("Header field " ++ show err ++ " is required, but missing"))
     return (y serial flags (map Variant body))
 
+checkUnixFdsHeader :: Monad m => [HeaderField] -> [Fd] -> ErrorT UnmarshalError m ()
+checkUnixFdsHeader fields fds = do
+    let numUnixFds = findUnixFds fields
+    when (numUnixFds /= length fds) $
+        throwErrorT (UnmarshalError ("File descriptor count in message header"
+          <> " (" <> show numUnixFds <> ") does not match the number of file descriptors"
+          <> " received from the socket (" <> show (length fds) <> ")."))
+
 findBodySignature :: [HeaderField] -> Signature
 findBodySignature fields = fromMaybe (signature_ []) (listToMaybe [x | HeaderSignature x <- fields])
+
+findUnixFds :: [HeaderField] -> Int
+findUnixFds fields = fromMaybe 0 (listToMaybe [fromIntegral n | HeaderUnixFds n <- fields])
 
 buildReceivedMessage :: Word8 -> [HeaderField] -> ErrorM String (Serial -> Word8 -> [Variant] -> ReceivedMessage)
 buildReceivedMessage 1 fields = do
@@ -732,13 +753,14 @@ require label _     = throwErrorM label
 
 unmarshalMessage :: ByteString -> [Fd] -> Either UnmarshalError ReceivedMessage
 unmarshalMessage bytes fds = checkError (Get.runGet get bytes) where
-    get = unmarshalMessageM getBytes fds
+    get = unmarshalMessageM getBytes
 
     -- wrap getByteString, so it will behave like transportGet and return
     -- a truncated result on EOF instead of throwing an exception.
     getBytes count = do
         remaining <- Get.remaining
-        Get.getByteString (min remaining count)
+        buf <- Get.getByteString (min remaining count)
+        return (buf, if remaining == Data.ByteString.length bytes then fds else [])
 
     checkError (Left err) = Left (UnmarshalError err)
     checkError (Right x) = x
