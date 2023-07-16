@@ -337,7 +337,7 @@ test_TransportSendReceive_FileDescriptors = nonWindowsTestCase "send-receive-fil
 
 test_HandleLostConnection :: TestTree
 test_HandleLostConnection = testCase "handle-lost-connection" $ runResourceT $ do
-    (addr, networkSocket, _) <- listenRandomIPv4 -- todo:this should error!
+    (addr, networkSocket, _) <- listenRandomIPv4
 
     _ <- liftIO $ forkIO $ do
         (s, _) <- NS.accept networkSocket

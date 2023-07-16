@@ -349,7 +349,6 @@ unmarshalDouble = unmarshalGet 8
     getFloat64be
     getFloat64le
 
--- todo: chuck error if fds not supported
 marshalUnixFd :: Fd -> Marshal ()
 marshalUnixFd fd@(Fd x)
     | x < 0 = throwError ("Invalid file descriptor: " ++ show x)
