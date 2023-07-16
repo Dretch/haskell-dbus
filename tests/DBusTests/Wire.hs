@@ -18,7 +18,7 @@ module DBusTests.Wire (test_Wire) where
 
 import Data.Bifunctor (first)
 import Data.Either
-import System.Posix (Fd(..))
+import System.Posix.Types (Fd(..))
 import Test.Tasty
 import Test.Tasty.HUnit
 
