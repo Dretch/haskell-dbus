@@ -16,6 +16,7 @@
 
 module DBusTests.Wire (test_Wire) where
 
+import Data.Bifunctor (first)
 import Data.Either
 import System.Posix.Types (Fd(..))
 import Test.Tasty
@@ -66,15 +67,15 @@ test_FileDescriptors_Marshal = testCaseSteps "(un)marshal round trip" $ \step ->
     fds @?= [Fd 2, Fd 1, Fd 3]
 
     step "unmarshal"
-    let Right call = unmarshal bytes [Fd 4, Fd 5, Fd 6]
-    receivedMessageBody call @?= [toVariant [Fd 4, Fd 5, Fd 4, Fd 6, Fd 5]]
+    let result = receivedMessageBody <$> unmarshal bytes [Fd 4, Fd 5, Fd 6]
+    result @?= Right [toVariant [Fd 4, Fd 5, Fd 4, Fd 6, Fd 5]]
 
 test_FileDescriptors_UnmarshalHeaderError :: TestTree
 test_FileDescriptors_UnmarshalHeaderError = testCase "UnixFdHeader mismatch" $ do
     let msg = (methodCall "/" "org.example.iface" "Foo")
             { methodCallBody = [toVariant [Fd 1, Fd 2, Fd 3]] }
-        Right (bytes, fds) = marshal LittleEndian firstSerial msg
+        Right (bytes, _fds) = marshal LittleEndian firstSerial msg
         
-    let Left err = unmarshal bytes [Fd 4, Fd 6]
-    unmarshalErrorMessage err @?= "File descriptor count in message header (3)"
-      <> " does not match the number of file descriptors received from the socket (2)."
+    let result = first unmarshalErrorMessage (unmarshal bytes [Fd 4, Fd 6])
+    result @?= Left ("File descriptor count in message header (3)"
+      <> " does not match the number of file descriptors received from the socket (2).")
