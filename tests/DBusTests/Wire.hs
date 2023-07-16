@@ -61,20 +61,20 @@ test_FileDescriptors_Marshal = testCaseSteps "(un)marshal round trip" $ \step ->
     let baseMsg = methodCall "/" "org.example.iface" "Foo"
     
     step "marshal"
-    let msg = baseMsg { methodCallBody = [toVariant [Fd 4, Fd 3, Fd 4, Fd 7, Fd 3]] }
+    let msg = baseMsg { methodCallBody = [toVariant [Fd 2, Fd 1, Fd 2, Fd 3, Fd 1]] }
         Right (bytes, fds) = marshal LittleEndian firstSerial msg
-    fds @?= [Fd 4, Fd 3, Fd 7]
+    fds @?= [Fd 2, Fd 1, Fd 3]
 
     step "unmarshal"
-    let Right call = unmarshal bytes [Fd 10, Fd 11, Fd 12]
-    receivedMessageBody call @?= [toVariant [Fd 10, Fd 11, Fd 10, Fd 12, Fd 11]]
+    let Right call = unmarshal bytes [Fd 4, Fd 5, Fd 6]
+    receivedMessageBody call @?= [toVariant [Fd 4, Fd 5, Fd 4, Fd 6, Fd 5]]
 
 test_FileDescriptors_UnmarshalHeaderError :: TestTree
 test_FileDescriptors_UnmarshalHeaderError = testCase "UnixFdHeader mismatch" $ do
     let msg = (methodCall "/" "org.example.iface" "Foo")
-            { methodCallBody = [toVariant [Fd 5, Fd 6, Fd 7]] }
+            { methodCallBody = [toVariant [Fd 1, Fd 2, Fd 3]] }
         Right (bytes, fds) = marshal LittleEndian firstSerial msg
         
-    let Left err = unmarshal bytes [Fd 5, Fd 6]
+    let Left err = unmarshal bytes [Fd 4, Fd 6]
     unmarshalErrorMessage err @?= "File descriptor count in message header (3)"
       <> " does not match the number of file descriptors received from the socket (2)."
