@@ -682,7 +682,7 @@ unmarshalMessageM getBytes' = runErrorT $ do
     (_, paddingFds) <- getBytes (fromIntegral bodyPadding)
     let bodySig = findBodySignature fields
     (bodyBytes, bodyFds) <- getBytes (fromIntegral bodyLength)
-    let R = fixedFds <> fieldFds <> paddingFds <> bodyFds
+    let fds = fixedFds <> fieldFds <> paddingFds <> bodyFds
     checkUnixFdsHeader fields fds
     body <- unmarshal' bodySig bodyBytes fds
     y <- case runErrorM (buildReceivedMessage messageType fields) of
