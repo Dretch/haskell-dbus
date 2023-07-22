@@ -46,7 +46,7 @@ import qualified Data.Vector
 import           Data.Vector (Vector)
 import           Data.Word (Word8, Word16, Word32, Word64)
 import           Foreign.C.Types (CInt)
-import           System.Posix (Fd(..))
+import           System.Posix.Types (Fd(..))
 import           Prelude
 
 import qualified Data.Serialize.Get as Get
@@ -642,7 +642,7 @@ unmarshalMessageM getBytes' = runErrorT $ do
                 else return (bytes, fds)
 
     let Just fixedSig = parseSignature "yyyyuuu"
-    (fixedBytes, fds) <- getBytes 16
+    (fixedBytes, fixedFds) <- getBytes 16
 
     let messageVersion = Data.ByteString.index fixedBytes 3
     when (messageVersion /= protocolVersion) (throwErrorT (UnmarshalError ("Unsupported protocol version: " ++ show messageVersion)))
@@ -671,7 +671,7 @@ unmarshalMessageM getBytes' = runErrorT $ do
         throwErrorT (UnmarshalError ("Message size " ++ show messageLength ++ " exceeds limit of " ++ show messageMaximumLength))
 
     let Just headerSig  = parseSignature "yyyyuua(yv)"
-    (fieldBytes, _) <- getBytes (fromIntegral fieldByteCount)
+    (fieldBytes, fieldFds) <- getBytes (fromIntegral fieldByteCount)
     let headerBytes = Data.ByteString.append fixedBytes fieldBytes
     header <- unmarshal' headerSig headerBytes []
 
@@ -679,10 +679,11 @@ unmarshalMessageM getBytes' = runErrorT $ do
     fields <- case runErrorM $ concat `liftM` mapM decodeField fieldArray of
         Left err -> throwErrorT err
         Right x -> return x
-    _ <- getBytes (fromIntegral bodyPadding)
-    checkUnixFdsHeader fields fds
+    (_, paddingFds) <- getBytes (fromIntegral bodyPadding)
     let bodySig = findBodySignature fields
-    (bodyBytes, _) <- getBytes (fromIntegral bodyLength)
+    (bodyBytes, bodyFds) <- getBytes (fromIntegral bodyLength)
+    let R = fixedFds <> fieldFds <> paddingFds <> bodyFds
+    checkUnixFdsHeader fields fds
     body <- unmarshal' bodySig bodyBytes fds
     y <- case runErrorM (buildReceivedMessage messageType fields) of
         Right x -> return x
