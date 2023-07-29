@@ -49,6 +49,7 @@ test_Transport = testGroup "Transport" $
     , suite_TransportAccept
     , test_TransportSendReceive
     , test_TransportSendReceive_FileDescriptors
+    , test_TransportSendReceive_FileDescriptors_MultiplePuts
     , test_HandleLostConnection
     ]
 
@@ -308,6 +309,34 @@ test_TransportSendReceive = testCase "send-receive" $ runResourceT $ do
 
 test_TransportSendReceive_FileDescriptors :: TestTree
 test_TransportSendReceive_FileDescriptors = nonWindowsTestCase "send-receive-file-descriptors" $ runResourceT $ do
+    (addr, networkSocket, _) <- listenRandomUnixAbstract
+    startEchoServer networkSocket
+
+    (_, t) <- allocate
+        (transportOpen socketTransportOptions addr)
+        transportClose
+    
+    liftIO $ withTempFd $ \fd1 -> withTempFd $ \fd2 -> do
+
+        -- in order to know that the file descriptors received back from the echo server
+        -- point to the same files as the file descriptors that were sent, we write data
+        -- on the initial file descriptors and read it back from the returned ones.
+        void $ fdWrite fd1 "1"
+        void $ fdSeek fd1 AbsoluteSeek 0
+        void $ fdWrite fd2 "2"
+        void $ fdSeek fd2 AbsoluteSeek 0
+
+        -- file descriptors from multiple chunks are combined
+        var <- forkVar (transportGet t 1)
+        liftIO (transportPut t "x" [fd1, fd2])
+        ("x", [fd1', fd2']) <- liftIO (readMVar var)
+        (fd1Val, _) <- liftIO (fdRead fd1' 1)
+        (fd2Val, _) <- liftIO (fdRead fd2' 2)
+        fd1Val @?= "1"
+        fd2Val @?= "2"
+
+test_TransportSendReceive_FileDescriptors_MultiplePuts :: TestTree
+test_TransportSendReceive_FileDescriptors_MultiplePuts = nonWindowsTestCase "send-receive-file-descriptors-multiple-puts" $ runResourceT $ do
     (addr, networkSocket, _) <- listenRandomUnixAbstract
     startEchoServer networkSocket
 

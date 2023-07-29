@@ -43,19 +43,23 @@ import           Control.Monad (when)
 import qualified Data.ByteString
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString.Builder as Builder
+import           Data.ByteString.Internal (ByteString(PS))
 import qualified Data.ByteString.Lazy as Lazy
 import           Data.ByteString.Unsafe (unsafeUseAsCString)
 import qualified Data.Map as Map
-import           Data.Maybe (catMaybes)
+import           Data.Maybe (fromMaybe)
 import           Data.Monoid
 import           Data.Typeable (Typeable)
 import           Foreign.C (CInt, CUInt)
+import           Foreign.ForeignPtr (withForeignPtr)
 import           Foreign.Ptr (castPtr, plusPtr)
+import           Foreign.Marshal.Array (peekArray)
 import           Foreign.Storable (sizeOf)
 import           Network.Socket
 import           Network.Socket.Address (SocketAddress(..))
 import qualified Network.Socket.Address
 import           Network.Socket.ByteString (recvMsg)
+import           System.IO.Unsafe (unsafeDupablePerformIO)
 import qualified System.Info
 import           System.Posix (Fd)
 import           Prelude
@@ -159,6 +163,7 @@ instance Transport SocketTransport where
     transportGet (SocketTransport addr s) n = catchIOException addr (recvWithFds s n)
     transportClose (SocketTransport addr s) = catchIOException addr (close s)
 
+-- todo: import from network package, when released (https://github.com/haskell/network/pull/562)
 data NullSockAddr = NullSockAddr
 
 instance SocketAddress NullSockAddr where
@@ -479,4 +484,18 @@ waitWhen0 _ _ = return ()
 
 decodeFdCmsgs :: [Cmsg] -> [Fd]
 decodeFdCmsgs cmsgs =
-    catMaybes (decodeCmsg <$> cmsgs)
+    foldMap (fromMaybe [] . decodeFdCmsg) cmsgs
+
+-- | Special decode function to handle > 1 Fd. Might be able to replace with a function
+-- from the network package in future (https://github.com/haskell/network/issues/566)
+decodeFdCmsg :: Cmsg -> Maybe [Fd]
+decodeFdCmsg (Cmsg cmsid (PS fptr off len))
+  | cmsid /= CmsgIdFd = Nothing
+  | len < sizeOfFd = Nothing
+  | otherwise =
+    unsafeDupablePerformIO $ withForeignPtr fptr $ \p0 -> do
+      let p = castPtr (p0 `plusPtr` off)
+          numFds = len `div` sizeOfFd
+      Just <$> peekArray numFds p
+  where
+      sizeOfFd = sizeOf (0 :: Fd)
